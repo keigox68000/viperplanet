@@ -22,9 +22,8 @@ GAME_CONFIG = {
     },
     "scorpion": {
         "initial_speed": 0.4,
-        "speed_increase_interval": 600,  # 10秒ごとに速度アップ
-        "speed_increase_amount": 0.1,  # 速度の増加量
-        "concurrency_increase_interval": 1200,  # 20秒ごとに出現数増加
+        "speed_increase_on_kill": 0.05,
+        "spawn_interval": 600,  # 10秒ごとに出現
         "blink_duration": 120,  # 点滅している時間
         "chase_interval": 40,  # 動きの方向を変える間隔
     },
@@ -36,6 +35,7 @@ GAME_CONFIG = {
     },
     "particles": {"count": 25, "lifespan_min": 20, "lifespan_max": 40},
     "wave_start_duration": 120,  # WAVE開始メッセージの表示時間 (2秒)
+    "game_over_duration": 180,  # ゲームオーバー画面の表示時間 (3秒)
 }
 
 # --- グローバル定数 ---
@@ -65,7 +65,7 @@ SPRITES = {
 
 # --- 状態管理 ---
 class GameState(Enum):
-    PLAYING, GAME_OVER, WAVE_START = auto(), auto(), auto()
+    TITLE, PLAYING, GAME_OVER, WAVE_START = auto(), auto(), auto(), auto()
 
 
 class SnakeState(Enum):
@@ -633,7 +633,7 @@ class App:
         pyxel.init(
             GAME_CONFIG["screen"]["width"],
             GAME_CONFIG["screen"]["height"],
-            title="Snake World Proto",
+            title="VIPER PLANET",
             fps=60,
         )
         try:
@@ -646,28 +646,25 @@ class App:
         pyxel.run(self.update, self.draw)
 
     def setup(self):
+        """タイトル画面のセットアップと、ゲーム全体の変数の初期化"""
+        self.game_state = GameState.TITLE
+        self.rocks, self.cacti = [], []
+        self.place_obstacles(False)  # プレイヤーを考慮せずに障害物を配置
+        self.persistent_scorpion_speed = GAME_CONFIG["scorpion"]["initial_speed"]
+        self.game_over_timer = 0
         self.player = Player()
         self.slogger = Slogger()
         self.snakes = [Snake() for _ in range(GAME_CONFIG["snake"]["max_count"])]
         self.active_scorpions = []
         self.scorpion_corpses = []
-        self.rocks, self.cacti = [], []
         self.particles = []
         self.venoms = []
-        self.game_state = GameState.PLAYING
         self.snake_spawn_timer = 0
 
-        # WAVE & Scorpion Management
+    def start_game(self):
+        """実際のゲームプレイを開始する"""
         self.wave = 0
-        self.snakes_defeated_in_wave = 0
-        self.snakes_to_defeat_for_next_wave = 0
-        self.max_concurrent_snakes = 0
-        self.current_venom_speed = 0
-        self.wave_max_scorpions = 0
-        self.current_scorpion_speed = 0
-        self.scorpion_speed_timer = 0
-        self.scorpion_concurrency_timer = 0
-        self.wave_start_timer = 0
+        self.persistent_scorpion_speed = GAME_CONFIG["scorpion"]["initial_speed"]
         self.start_new_wave()
 
     def start_new_wave(self):
@@ -683,9 +680,11 @@ class App:
         self.scorpion_corpses.clear()
         self.active_scorpions.clear()
 
+        self.player.reset()
+
         for s in self.snakes:
             s.state = SnakeState.INACTIVE
-        self.place_obstacles()
+        self.place_obstacles(True)  # プレイヤーを考慮して障害物を配置
 
         # Snake difficulty
         self.snakes_defeated_in_wave = 0
@@ -697,15 +696,25 @@ class App:
         )
 
         # Scorpion difficulty
-        self.wave_max_scorpions = 1 + (self.wave - 1) // 3
-        self.current_scorpion_speed = GAME_CONFIG["scorpion"]["initial_speed"]
-        self.scorpion_speed_timer = 0
-        self.scorpion_concurrency_timer = 0
+        self.wave_max_scorpions = 1 + (self.wave - 1) // 2
+        self.scorpion_spawn_timer = 0
 
-    def place_obstacles(self):
+    def place_obstacles(self, avoid_player):
         min_x = FIELD_X_MIN
         max_x = FIELD_X_MAX - 16
         min_y, max_y = 32, GAME_CONFIG["screen"]["height"] - 48
+
+        player_spawn_rect = None
+        if avoid_player:
+            player_w, player_h = SPRITES["PLAYER_1"]["w"], SPRITES["PLAYER_1"]["h"]
+            player_start_x = GAME_CONFIG["screen"]["width"] / 2 - player_w / 2
+            player_start_y = GAME_CONFIG["screen"]["height"] - player_h * 2
+            player_spawn_rect = (
+                player_start_x - 16,
+                player_start_y - 16,
+                player_w + 32,
+                player_h + 32,
+            )
 
         for _ in range(
             random.randint(
@@ -723,6 +732,10 @@ class App:
                     check_collision_rect_vs_rect(new_rect, r.get_rect())
                     for r in self.rocks
                 ):
+                    if avoid_player and check_collision_rect_vs_rect(
+                        new_rect, player_spawn_rect
+                    ):
+                        continue
                     self.rocks.append(Rock(x, y))
                     break
 
@@ -745,24 +758,38 @@ class App:
                     check_collision_rect_vs_rect(new_rect, c.get_rect())
                     for c in self.cacti
                 ):
+                    if avoid_player and check_collision_rect_vs_rect(
+                        new_rect, player_spawn_rect
+                    ):
+                        continue
                     self.cacti.append(Cactus(x, y))
                     break
 
     def update(self):
+        if self.game_state == GameState.TITLE:
+            if self.is_action_pressed():
+                self.start_game()
+            return
+
+        if self.game_state == GameState.GAME_OVER:
+            self.game_over_timer -= 1
+            if self.game_over_timer <= 0:
+                self.setup()
+            return
+
+        # ★★★ 修正：WAVE開始中でもプレイヤーと障害物の当たり判定を行う ★★★
+        player_movement_obstacles = self.rocks + [c for c in self.cacti if c.is_active]
+        self.player.update(player_movement_obstacles)
+
         if self.game_state == GameState.WAVE_START:
             self.wave_start_timer -= 1
             if self.wave_start_timer <= 0:
                 self.game_state = GameState.PLAYING
+
         elif self.game_state == GameState.PLAYING:
             self.update_playing()
-        elif self.game_state == GameState.GAME_OVER:
-            if self.is_action_pressed():
-                self.setup()
 
     def update_playing(self):
-        player_movement_obstacles = self.rocks + [c for c in self.cacti if c.is_active]
-        self.player.update(player_movement_obstacles)
-
         self.slogger.update(self.player, self.rocks, self.cacti, self.particles)
         if self.is_action_pressed():
             self.slogger.fire(self.player)
@@ -784,24 +811,9 @@ class App:
         self.check_collisions()
 
     def update_scorpions(self):
-        # 時間経過で速度を上げる
-        self.scorpion_speed_timer += 1
-        if (
-            self.scorpion_speed_timer
-            >= GAME_CONFIG["scorpion"]["speed_increase_interval"]
-        ):
-            self.current_scorpion_speed += GAME_CONFIG["scorpion"][
-                "speed_increase_amount"
-            ]
-            self.scorpion_speed_timer = 0
-
-        # 時間経過でサソリをスポーンさせる
-        self.scorpion_concurrency_timer += 1
-        if (
-            self.scorpion_concurrency_timer
-            >= GAME_CONFIG["scorpion"]["concurrency_increase_interval"]
-        ):
-            self.scorpion_concurrency_timer = 0
+        self.scorpion_spawn_timer += 1
+        if self.scorpion_spawn_timer >= GAME_CONFIG["scorpion"]["spawn_interval"]:
+            self.scorpion_spawn_timer = 0
             if len(self.active_scorpions) < self.wave_max_scorpions:
                 new_scorpion = Scorpion()
                 all_spawn_obstacles = (
@@ -813,11 +825,10 @@ class App:
                 new_scorpion.spawn(all_spawn_obstacles)
                 self.active_scorpions.append(new_scorpion)
 
-        # アクティブなサソリを更新
         all_scorpion_obstacles = self.rocks + self.cacti + self.scorpion_corpses
         for scorp in self.active_scorpions:
             scorp.update(
-                self.player, all_scorpion_obstacles, self.current_scorpion_speed
+                self.player, all_scorpion_obstacles, self.persistent_scorpion_speed
             )
 
     def is_action_pressed(self):
@@ -926,6 +937,9 @@ class App:
                 scorp.die()
                 scorpions_to_kill.append(scorp)
                 self.slogger.deactivate()
+                self.persistent_scorpion_speed += GAME_CONFIG["scorpion"][
+                    "speed_increase_on_kill"
+                ]
                 break
 
         if scorpions_to_kill:
@@ -956,6 +970,7 @@ class App:
         if self.player.is_alive:
             self.player.is_alive = False
             self.game_state = GameState.GAME_OVER
+            self.game_over_timer = GAME_CONFIG["game_over_duration"]
             player_center_x = self.player.x + self.player.w / 2
             player_center_y = self.player.y + self.player.h / 2
             for _ in range(GAME_CONFIG["particles"]["count"]):
@@ -963,41 +978,64 @@ class App:
 
     def draw(self):
         pyxel.cls(0)
-        self.player.draw()
-        self.slogger.draw()
-        for rock in self.rocks:
-            rock.draw()
-        for cactus in self.cacti:
-            cactus.draw()
-        for snake in self.snakes:
-            snake.draw()
-        for scorp in self.active_scorpions:
-            scorp.draw()
-        for corpse in self.scorpion_corpses:
-            corpse.draw()
-        for p in self.particles:
-            p.draw()
-        for v in self.venoms:
-            v.draw()
 
-        wave_text = f"WAVE {self.wave} ({self.snakes_defeated_in_wave}/{self.snakes_to_defeat_for_next_wave})"
-        pyxel.text(
-            GAME_CONFIG["screen"]["width"] - len(wave_text) * pyxel.FONT_WIDTH - 5,
-            5,
-            wave_text,
-            7,
-        )
+        # Draw background elements for all states except TITLE
+        if self.game_state != GameState.TITLE:
+            for rock in self.rocks:
+                rock.draw()
+            for cactus in self.cacti:
+                cactus.draw()
+            for snake in self.snakes:
+                snake.draw()
+            for scorp in self.active_scorpions:
+                scorp.draw()
+            for corpse in self.scorpion_corpses:
+                corpse.draw()
+            for p in self.particles:
+                p.draw()
+            for v in self.venoms:
+                v.draw()
+            self.player.draw()
+            self.slogger.draw()
+            wave_text = f"WAVE {self.wave} ({self.snakes_defeated_in_wave}/{self.snakes_to_defeat_for_next_wave})"
+            pyxel.text(
+                GAME_CONFIG["screen"]["width"] - len(wave_text) * pyxel.FONT_WIDTH - 5,
+                5,
+                wave_text,
+                7,
+            )
 
-        if self.game_state == GameState.WAVE_START:
+        if self.game_state == GameState.TITLE:
+            for rock in self.rocks:
+                rock.draw()
+            for cactus in self.cacti:
+                cactus.draw()
+            title_text = "VIPER PLANET"
+            x = (
+                GAME_CONFIG["screen"]["width"] - len(title_text) * pyxel.FONT_WIDTH
+            ) / 2
+            y = GAME_CONFIG["screen"]["height"] / 2 - 20
+            pyxel.text(x, y, title_text, 7)
+
+            prompt_text = "PUSH ANY BUTTON"
+            if (pyxel.frame_count // 15) % 2 == 0:
+                x = (
+                    GAME_CONFIG["screen"]["width"] - len(prompt_text) * pyxel.FONT_WIDTH
+                ) / 2
+                y += 20
+                pyxel.text(x, y, prompt_text, 13)
+
+        elif self.game_state == GameState.WAVE_START:
             text = f"WAVE {self.wave}"
             x = (GAME_CONFIG["screen"]["width"] - len(text) * pyxel.FONT_WIDTH) / 2
             y = (GAME_CONFIG["screen"]["height"] - pyxel.FONT_HEIGHT) / 2
             pyxel.text(x, y, text, 7)
         elif self.game_state == GameState.GAME_OVER:
             text = "GAME OVER"
-            x = GAME_CONFIG["screen"]["width"] / 2 - len(text) * pyxel.FONT_WIDTH / 2
-            y = GAME_CONFIG["screen"]["height"] / 2 - pyxel.FONT_HEIGHT / 2
-            pyxel.text(x, y, text, 7)
+            x = (GAME_CONFIG["screen"]["width"] - len(text) * pyxel.FONT_WIDTH) / 2
+            y = (GAME_CONFIG["screen"]["height"] - pyxel.FONT_HEIGHT) / 2
+            # ★★★ 修正：pyxel.textの引数を正しくする ★★★
+            pyxel.text(x, y, text, 8)  # Red color
 
 
 def check_collision_rect_vs_rect(rect1, rect2):
